@@ -1,0 +1,74 @@
+# ----------------------------
+# Python
+# ----------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+
+# ----------------------------
+# Virtual environments
+# ----------------------------
+.venv/
+venv/
+env/
+ENV/
+conda-env/
+.conda/
+
+# ----------------------------
+# Jupyter / notebooks
+# ----------------------------
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# ----------------------------
+# PyTorch / Lightning
+# ----------------------------
+*.pt
+*.pth
+*.ckpt
+lightning_logs/
+wandb/
+tensorboard/
+runs/
+
+# ----------------------------
+# Hydra outputs
+# ----------------------------
+outputs/
+multirun/
+hydra_outputs/
+
+# ----------------------------
+# nuScenes dataset (DO NOT COMMIT)
+# ----------------------------
+nuscenes/
+nuscenes-mini/
+nuscenes_full/
+nuscenes-devkit/
+
+# ----------------------------
+# Generated data / cache
+# ----------------------------
+*.npy
+*.npz
+*.pkl
+*.pickle
+.cache/
+tmp/
+temp/
+
+# ----------------------------
+# Logs
+# ----------------------------
+*.log
+logs/
+
+# ----------------------------
+# MacOS
+# ----------------------------
+.DS_Store_

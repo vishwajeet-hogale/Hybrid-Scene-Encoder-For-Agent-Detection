@@ -1,0 +1,25 @@
+_target_: src.data.nuscenes_datamodule.NuScenesDataModule
+
+data_root: nuscenes-mini
+version: v1.0-mini         # change to v1.0-trainval later
+train_split: train
+val_split: val
+test_split: test
+
+batch_size: 8
+num_workers: 4
+pin_memory: false
+persistent_workers: false
+shuffle: true
+drop_last: true
+
+
+# future knobs (we’ll use later)
+bev:
+  x_range: [-50.0, 50.0]
+  y_range: [-50.0, 50.0]
+  resolution: 0.5          # meters per cell
+
+map:
+  max_polylines: 256
+  points_per_polyline: 20

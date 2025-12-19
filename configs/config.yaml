@@ -1,0 +1,30 @@
+defaults:
+  - _self_
+  - datamodule: nuscenes
+
+seed: 42
+
+model:
+  _target_: src.models.lit_perception_model.LitPerceptionModel
+
+  pillar_cfg:
+    x_range: [-10.0, 70.0]
+    y_range: [-40.0, 40.0]
+    z_range: [-5.0, 3.0]
+
+    voxel_size: [0.5, 0.5]
+
+    max_pillars: 6000
+    max_points_per_pillar: 24
+  lr: 2e-4
+  weight_decay: 1e-4
+
+trainer:
+  _target_: lightning.pytorch.Trainer
+  accelerator: mps
+  devices: 1
+  precision: 32
+  max_epochs: 5
+  log_every_n_steps: 10
+  enable_checkpointing: true
+  default_root_dir: outputs
