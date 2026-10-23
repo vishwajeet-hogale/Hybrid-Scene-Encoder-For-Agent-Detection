@@ -41,6 +41,7 @@ LiDAR points ──► group into 0.5 m vertical columns ("pillars") ──► t
 8. Diagnose the weaknesses and build an improved model (v2).
 9. Compare v1 vs v2.
 10. Find out what the improved model still gets wrong (overfitting, heading, false positives).
+11. Add the cameras: LiDAR-camera fusion (BEVFusion-style).
 
 ---
 
@@ -429,6 +430,82 @@ center with a higher yaw weight.
    denser points for small/far objects (cyclists, pedestrians).
 3. **IoU-based evaluation and the official nuScenes metrics** (mAP over 0.5/1/2/4 m, NDS), with GT boxes that
    contain zero LiDAR points filtered out as the official eval does.
+
+---
+
+### Step 11 — Camera fusion (BEVFusion-style)
+
+**Short version:** a camera branch turns all six images into a bird's-eye-view feature map on the same 160 × 160
+grid as the LiDAR, a small fuser merges the two, and the existing backbone and head run on the result. Image
+features come from a frozen DINOv2 model; the depth needed to place them in 3D is guided by the LiDAR. It
+consistently improves vehicle detection (+0.037 AP), but it did not fix the clutter false positives.
+
+**Deep dive**
+
+*Architecture* — the `encoders` dict and `fusion` slot of `HybridSceneEncoder` were built for this:
+
+```
+6 cameras ─► frozen DINOv2 ViT-S/14 (cached) ─► 18×32×384 per camera ─┐
+                                                                       ├─► depth net (+ sparse LiDAR depth) ─► lift ─► splat ─► camera BEV [B,32,160,160] ─┐
+LiDAR points projected into each camera ──────────────────────────────┘                                                                                 ├─► fuser ─► multi-scale backbone ─► CenterHead
+LiDAR ─► pillars ─► PFN ─► scatter ─────────────────────────────────────────────────────────────────────────────────► LiDAR BEV  [B,64,160,160] ─┘
+```
+
+1. **Image features** (`src/data/camera.py`, `cache_camera_features.py`). Images are resized 1600×900 → 448×252
+   and run through a **frozen** DINOv2 ViT-S/14, giving an 18 × 32 grid of 384-d features per camera (one cell
+   = 50 × 50 original pixels). Frozen because 8 training scenes would make a trainable image backbone memorize
+   them; computed once for all 2,424 keyframe images (1 GB, ~17 min) so training stays fast.
+2. **Camera geometry.** For each camera: camera → ego(t_cam) → global → ego(t_lidar) — the same chain as in
+   Step 2 — plus the intrinsics rescaled to feature-grid units. The training augmentation (flip/rotate/scale) is
+   now also returned as a 4×4 matrix and applied to this transform, so both sensors stay aligned.
+3. **LiDAR-guided depth** (the BEVDepth idea). LiDAR points are projected into each camera's feature grid
+   (nearest depth per cell). The depth net sees that sparse depth as an input and is trained to predict it
+   (cross-entropy over 48 depth bins from 1 to 61 m) — turning the hardest part of camera 3D (depth) into a
+   mostly-supervised problem.
+4. **Lift and splat** (`src/models/camera/lss_encoder.py`, Lift-Splat-Shoot). Each cell's feature is multiplied
+   by its depth distribution, giving a feature at 48 points along the pixel's ray; those points are moved into
+   the ego frame and summed into the BEV grid with one fixed-size `index_add` (same trick as the LiDAR scatter,
+   so MPS shapes never change).
+5. **Fuser** (`src/models/fusion.py`): `out = lidar_bev + f(concat(lidar_bev, camera_bev))`, with the last conv of
+   `f` initialized to zero. A fusion model initialized from the LiDAR-only checkpoint therefore starts out
+   computing **exactly** the LiDAR-only prediction and learns how much camera information to add.
+
+*Checks before training:* augmentation matrix matches the augmented points (1e-5); LiDAR depth back-projected
+through the camera geometry lands a median 1.3 % of its depth from a real LiDAR point (within the 2 % feature
+cell); the splat matches an independent NumPy count exactly; the fused model initialized from LiDAR weights
+gives bit-identical outputs; memory flat in a real run. The camera branch adds only 0.27 M trainable parameters.
+
+*Training:* initialized from the best LiDAR model; new modules at LR 1e-3, the pretrained LiDAR path at 1e-4
+(`model.pretrained_lr_scale=0.1`) — the first attempt with one LR for everything knocked the pretrained weights
+out of their optimum (mAP fell to 0.115). A **control run** used the same fine-tune without cameras, so any gain
+can be attributed to the cameras rather than extra training.
+
+*Results* (val, averaged over the second half of training, 16 epochs, to beat 2-scene noise):
+
+| | mAP | Vehicle AP | Pedestrian AP |
+|---|---|---|---|
+| **LiDAR + camera** | **0.194 ± 0.008** | **0.455 ± 0.008** | 0.116 ± 0.015 |
+| LiDAR-only control | 0.181 ± 0.007 | 0.418 ± 0.013 | 0.119 ± 0.013 |
+
+Best single epochs: fusion 0.204 (vehicle 0.467), control 0.195.
+
+*What it did and didn't do:*
+
+- ✅ **More cars found**: +0.037 vehicle AP, consistently; maximum vehicle recall 0.27 → 0.35.
+- ❌ **No gain at high precision**: at matched precision (~0.92) recall is the same (0.25 vs 0.27) — the extra
+  cars are low-confidence ones, so a high-threshold demo looks similar.
+- ❌ **Clutter false positives not reduced**, pedestrians and heading unchanged.
+
+Why: each camera feature cell is 50 px wide (≈ 0.8 m at 20 m) — coarser than a pole — and lifting spreads each
+feature along its ray (visible as orange streaks along the road in the demo's heatmap panel). With 8 training
+scenes the fuser mostly learned the strong, easy signal: more evidence of cars. The natural next step for clutter
+is **PointPainting**: per-point labels from a segmentation model with an explicit "pole" class, read at each
+LiDAR point's exact pixel.
+
+```bash
+.venv/bin/python cache_camera_features.py                      # once: DINOv2 features for all keyframe images
+.venv/bin/python train.py use_camera=true init_ckpt=<lidar best.ckpt> model.lr=1e-3 model.pretrained_lr_scale=0.1
+```
 
 ---
 

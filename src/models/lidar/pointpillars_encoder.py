@@ -82,18 +82,20 @@ class BEVBackbone(nn.Module):
 class PointPillarsEncoder(nn.Module):
     """
     Input:  list of B point clouds, each [Ni,4] ego frame
-    Output: BEV features [B, C, H, W]
+    Output: BEV features [B, C, H, W] (pillar pseudo-image [B, pillar_feat_dim, H, W] if with_backbone=False)
     """
     def __init__(
         self,
         cfg: PillarConfig,
         pillar_feat_dim: int = 64,
         bev_feat_dim: int = 128,
+        with_backbone: bool = True,
     ):
         super().__init__()
         self.cfg = cfg
         self.pfn = PillarFeatureNet(9, pillar_feat_dim)
-        self.backbone = BEVBackbone(pillar_feat_dim, bev_feat_dim)
+        # with_backbone=False returns the pillar pseudo-image, so a fusion model can run a shared backbone after fusion
+        self.backbone = BEVBackbone(pillar_feat_dim, bev_feat_dim) if with_backbone else None
 
         self.H = int((cfg.y_range[1] - cfg.y_range[0]) / cfg.voxel_size[1])
         self.W = int((cfg.x_range[1] - cfg.x_range[0]) / cfg.voxel_size[0])
@@ -128,5 +130,6 @@ class PointPillarsEncoder(nn.Module):
         # contiguous() matters: a strided BEV propagates through the convs and breaks BatchNorm backward on MPS
         bev = bev.reshape(B, HW + 1, Cp)[:, :HW].permute(0, 2, 1).reshape(B, Cp, self.H, self.W).contiguous()
 
-        bev = self.backbone(bev)             # [B,C,H,W]
+        if self.backbone is not None:
+            bev = self.backbone(bev)         # [B,C,H,W]
         return bev

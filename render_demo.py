@@ -22,6 +22,7 @@ from nuscenes.utils.geometry_utils import transform_matrix
 from nuscenes.utils.splits import create_splits_scenes
 from pyquaternion import Quaternion
 
+from src.data.camera import CAMERAS, CameraFeatureStore, build_camera_inputs
 from src.data.nuscenes_dataset import load_lidar_points_ego
 from src.models.lit_perception_model import LitPerceptionModel
 
@@ -191,7 +192,7 @@ def draw_boxes_on_camera(img: np.ndarray, boxes: np.ndarray, labels: np.ndarray,
 
 
 def compose_frame(bev: np.ndarray, heat: np.ndarray, cam: np.ndarray, labels: np.ndarray,
-                  scene_name: str, t_sec: float, split_tag: str) -> np.ndarray:
+                  scene_name: str, t_sec: float, split_tag: str, title: str) -> np.ndarray:
     """Layout: title bar, camera across the top, BEV boxes | heatmap side by side below."""
     W, gap, top = cam.shape[1], 12, 70
     side = (W - gap) // 2
@@ -206,7 +207,7 @@ def compose_frame(bev: np.ndarray, heat: np.ndarray, cam: np.ndarray, labels: np
     pil = Image.fromarray(canvas)
     d = ImageDraw.Draw(pil)
     f_title, f_small = load_font(30), load_font(20)
-    d.text((20, 18), "3D agent detection  ·  PointPillars + CenterPoint-style head", font=f_title, fill=(240, 240, 245))
+    d.text((20, 18), title, font=f_title, fill=(240, 240, 245))
     info = f"nuScenes {scene_name} ({split_tag})   t = {t_sec:4.1f} s"
     d.text((canvas.shape[1] - 20 - d.textlength(info, font=f_small), 26), info, font=f_small, fill=(150, 155, 170))
 
@@ -238,6 +239,7 @@ def main():
     ap.add_argument("--score", type=str, default="0.2,0.3,0.3",
                     help="score threshold, one value or one per class (vehicle,pedestrian,cyclist)")
     ap.add_argument("--max_frames", type=int, default=0)
+    ap.add_argument("--camera_cache", default="cache/dinov2_vits14", help="cached DINOv2 features (camera-fusion models)")
     ap.add_argument("--gif_width", type=int, default=720)
     ap.add_argument("--gif_seconds", type=float, default=8.0, help="GIF length (the MP4 always has the full scene)")
     ap.add_argument("--crf", type=int, default=26, help="H.264 quality for the MP4 (lower = bigger/better)")
@@ -259,6 +261,14 @@ def main():
     cam_tokens = scene_channel_tokens(nusc, scene, "CAM_FRONT")
     cam_ts = np.array([nusc.get("sample_data", t)["timestamp"] for t in cam_tokens])
 
+    # camera-fusion models need all 6 cameras per sweep; uncached (non-keyframe) images are encoded on the fly
+    if model.use_camera:
+        all_cams = {c: scene_channel_tokens(nusc, scene, c) for c in CAMERAS}
+        all_cam_ts = {c: np.array([nusc.get("sample_data", t)["timestamp"] for t in all_cams[c]]) for c in CAMERAS}
+        store = CameraFeatureStore(args.camera_cache, allow_compute=True)
+
+    title = ("3D agent detection  ·  LiDAR + camera fusion (BEVFusion-style)" if model.use_camera
+             else "3D agent detection  ·  PointPillars + CenterPoint-style head")
     bev_renderer = BEVRenderer((grid.x_min, grid.x_max), (grid.y_min, grid.y_max), res=0.1)
     frames_dir = os.path.join(args.out, f"{args.scene}_frames")
     shutil.rmtree(frames_dir, ignore_errors=True)
@@ -269,8 +279,14 @@ def main():
         lidar_sd = nusc.get("sample_data", tok)
         points = load_lidar_points_ego(nusc, tok)
 
+        batch = {"lidar_points": [points]}
+        if model.use_camera:
+            nearest = [all_cams[c][int(np.argmin(np.abs(all_cam_ts[c] - lidar_sd["timestamp"])))] for c in CAMERAS]
+            cam_inputs = build_camera_inputs(nusc, tok, nearest, points.numpy(), store)
+            batch.update({k: v.unsqueeze(0).to(device) for k, v in cam_inputs.items()})
+
         with torch.no_grad():
-            bev_feat = model({"lidar_points": [points.to(device)]})["bev"]
+            bev_feat = model(batch)["bev"]
             hm_logits, reg = model.head(bev_feat)
             det = model.decode(hm_logits, reg, score_thresh=min(thresholds))[0]
         keep = det["scores"].numpy() >= np.asarray(thresholds)[det["labels"].numpy()]
@@ -285,7 +301,7 @@ def main():
 
         bev_img = bev_renderer.render(points.numpy(), boxes, labels)
         heat_img = bev_renderer.render_heatmap(hm, points.numpy(), boxes)
-        frame = compose_frame(bev_img, heat_img, cam_img, labels, args.scene, (lidar_sd["timestamp"] - t0) / 1e6, split_tag)
+        frame = compose_frame(bev_img, heat_img, cam_img, labels, args.scene, (lidar_sd["timestamp"] - t0) / 1e6, split_tag, title)
         cv2.imwrite(os.path.join(frames_dir, f"{i:04d}.png"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         print(f"\rframe {i + 1}/{len(lidar_tokens)}  ({len(boxes)} boxes)", end="", flush=True)
     print()

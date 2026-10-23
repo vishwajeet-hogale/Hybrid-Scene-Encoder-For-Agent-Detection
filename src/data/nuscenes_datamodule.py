@@ -8,6 +8,7 @@ from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.splits import create_splits_scenes
 
 from src.data.nuscenes_dataset import NuScenesDataset
+from src.data.camera import CameraFeatureStore
 from src.data.collate import hybrid_collate
 
 
@@ -48,6 +49,8 @@ class NuScenesDataModule(L.LightningDataModule):
         bev: Dict[str, Any],
         map: Dict[str, Any],
         augment: bool = True,
+        use_camera: bool = False,
+        camera_cache: str = "cache/dinov2_vits14",
     ):
         super().__init__()
         self.data_root = data_root
@@ -67,6 +70,8 @@ class NuScenesDataModule(L.LightningDataModule):
         self.bev_cfg = bev
         self.map_cfg = map
         self.augment = augment
+        # camera fusion: cached DINOv2 features (run cache_camera_features.py first)
+        self.camera_store = CameraFeatureStore(camera_cache) if use_camera else None
 
         self.nusc: Optional[NuScenes] = None
         self.ds_train: Optional[NuScenesDataset] = None
@@ -88,14 +93,16 @@ class NuScenesDataModule(L.LightningDataModule):
             val_tokens = build_samples_from_scenes(self.nusc, val_scenes)
 
             self.ds_train = NuScenesDataset(self.nusc, train_tokens, split="train", bev_cfg=self.bev_cfg, map_cfg=self.map_cfg,
-                                           augment=self.augment)
-            self.ds_val = NuScenesDataset(self.nusc, val_tokens, split="val", bev_cfg=self.bev_cfg, map_cfg=self.map_cfg)
+                                           augment=self.augment, camera_store=self.camera_store)
+            self.ds_val = NuScenesDataset(self.nusc, val_tokens, split="val", bev_cfg=self.bev_cfg, map_cfg=self.map_cfg,
+                                         camera_store=self.camera_store)
 
         if stage in (None, "test"):
             test_scenes = splits[self.test_split]
             test_tokens = build_samples_from_scenes(self.nusc, test_scenes)
 
-            self.ds_test = NuScenesDataset(self.nusc, test_tokens, split="test", bev_cfg=self.bev_cfg, map_cfg=self.map_cfg)
+            self.ds_test = NuScenesDataset(self.nusc, test_tokens, split="test", bev_cfg=self.bev_cfg, map_cfg=self.map_cfg,
+                                          camera_store=self.camera_store)
 
     def train_dataloader(self) -> DataLoader:
         assert self.ds_train is not None

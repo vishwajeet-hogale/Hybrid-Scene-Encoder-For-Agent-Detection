@@ -12,6 +12,8 @@ pin_memory: false
 persistent_workers: true     # avoid re-spawning workers (and re-pickling NuScenes) every epoch
 shuffle: true
 drop_last: true
+use_camera: ${use_camera}
+camera_cache: cache/dinov2_vits14
 augment: true              # flip / rotate / scale on the train split only
 
 

@@ -2,25 +2,30 @@
 
 ![Demo: predicted 3D boxes on a held-out nuScenes scene](docs/media/demo_scene-0103.gif)
 
-*Held-out nuScenes scene-0103. Top: front camera with the predicted 3D boxes projected into it. Bottom left:
-LiDAR bird's-eye view with boxes. Bottom right: the CenterHead heatmap (where the model "sees" object centers).*
+*LiDAR + camera fusion on held-out nuScenes scene-0103. Top: front camera with the predicted 3D boxes projected
+into it. Bottom left: LiDAR bird's-eye view with boxes. Bottom right: the CenterHead heatmap (where the model
+"sees" object centers).*
 
 ## Current results (nuScenes-mini)
 
-LiDAR-only 3D detection of vehicles, pedestrians and cyclists: 4-DoF pose (x, y, z, yaw) + 3D size per agent.
+3D detection of vehicles, pedestrians and cyclists from LiDAR and all six cameras: 4-DoF pose (x, y, z, yaw) +
+3D size per agent.
 Trained on the 8 `mini_train` scenes, evaluated on the 2 held-out `mini_val` scenes with center-distance AP (2 m).
 
 | Model | mAP | Vehicle AP | Pedestrian AP |
 |---|---|---|---|
 | v1: single-scale backbone | 0.123 | 0.280 | 0.088 |
-| v2: multi-scale backbone, 9-feature pillars, normalized targets, augmentation | **0.196** | **0.430** | **0.149** |
+| v2: multi-scale backbone, 9-feature pillars, normalized targets, augmentation | 0.196 | 0.430 | **0.149** |
+| v2 + camera fusion (BEVFusion-style, frozen DINOv2, LiDAR-guided depth) | **0.204** | **0.467** | 0.132 |
 
 The full story, from downloading the data to these results (coordinate frames, the model, bugs found, the
 Apple-GPU memory leak, evaluation and known weaknesses), is in
 [docs/PROJECT_WALKTHROUGH.md](docs/PROJECT_WALKTHROUGH.md).
 
 ```bash
-.venv/bin/python train.py                                    # train (Hydra config in configs/)
+.venv/bin/python train.py                                    # train LiDAR-only (Hydra config in configs/)
+.venv/bin/python cache_camera_features.py                    # once, for camera fusion
+.venv/bin/python train.py use_camera=true init_ckpt=<lidar best.ckpt> model.pretrained_lr_scale=0.1   # fusion
 .venv/bin/python render_demo.py --ckpt <best.ckpt> --scene scene-0103 --score 0.3,0.4,0.4   # demo video + GIF
 ```
 

@@ -73,3 +73,7 @@ logs/
 # ----------------------------
 .DS_Store_
 .DS_Store
+# ----------------------------
+# Cached camera features (cache_camera_features.py)
+# ----------------------------
+cache/

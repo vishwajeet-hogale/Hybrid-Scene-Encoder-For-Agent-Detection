@@ -5,7 +5,9 @@ import torch
 import lightning.pytorch as L
 
 from src.models.hybrid_scene_encoder import HybridSceneEncoder
-from src.models.lidar.pointpillars_encoder import PointPillarsEncoder
+from src.models.lidar.pointpillars_encoder import BEVBackbone, PointPillarsEncoder
+from src.models.camera.lss_encoder import CameraBEVEncoder
+from src.models.fusion import ConvFuser
 from src.models.lidar.pillars import PillarConfig
 from src.models.heads.center_head import CenterHead
 from src.models.heads.targets import BoxPrior, GridSpec, build_targets
@@ -21,7 +23,7 @@ CLASS_NAMES = ["vehicle", "pedestrian", "cyclist"]
 class LitPerceptionModel(L.LightningModule):
     """
     LightningModule that owns:
-    - Hybrid scene encoder (LiDAR now, map/camera later)
+    - Hybrid scene encoder (LiDAR, optionally fused with cameras; map later)
     - Task heads (detection now, prediction/planning later)
     """
     def __init__(
@@ -32,21 +34,34 @@ class LitPerceptionModel(L.LightningModule):
         hm_weight: float = 1.0,
         reg_weight: float = 0.25,
         pct_start: float = 0.4,
+        use_camera: bool = False,
+        depth_weight: float = 0.5,
+        pretrained_lr_scale: float = 1.0,
     ):
         super().__init__()
         self.save_hyperparameters()
 
         # ---- Encoders ----
-        lidar_encoder = PointPillarsEncoder(PillarConfig(**pillar_cfg))
+        self.use_camera = use_camera
+        self.depth_weight = depth_weight
+        pillar_config = PillarConfig(**pillar_cfg)
+        # with cameras, the BEV backbone runs after fusion, shared by both modalities (BEVFusion layout)
+        lidar_encoder = PointPillarsEncoder(pillar_config, with_backbone=not use_camera)
 
         encoders = torch.nn.ModuleDict({
             "lidar": lidar_encoder,
-            # future: "map", "camera"
+            # future: "map"
         })
+        fusion, backbone = None, None
+        if use_camera:
+            encoders["camera"] = CameraBEVEncoder(pillar_config)
+            fusion = ConvFuser(lidar_channels=64, camera_channels=encoders["camera"].out_channels)
+            backbone = BEVBackbone(64, 128)
 
         self.scene_encoder = HybridSceneEncoder(
             encoders=encoders,
-            fusion=None,   # future: cross-attn / FiLM / concat
+            fusion=fusion,
+            backbone=backbone,
         )
         self.num_classes = len(CLASS_NAMES)  # vehicle, pedestrian, cyclist (matches the dataset mapping)
         self.head = CenterHead(in_channels=128, num_classes=self.num_classes, reg_channels=8)
@@ -77,10 +92,14 @@ class LitPerceptionModel(L.LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
         self.pct_start = pct_start
+        self.pretrained_lr_scale = pretrained_lr_scale
 
     def transfer_batch_to_device(self, batch: Dict[str, Any], device: torch.device, dataloader_idx: int):
         # lidar_points / gt_boxes / gt_labels stay on CPU: pillarization, target building and AP matching are
         # variable-size CPU work; only fixed-size tensors go to the accelerator (see PointPillarsEncoder.forward)
+        for k in ("cam_feats", "cam2ego", "cam_K", "cam_depth"):
+            if k in batch:
+                batch[k] = batch[k].to(device)
         if "map_polylines" in batch:
             batch["map_polylines"] = batch["map_polylines"].to(device)
         if "map_mask" in batch:
@@ -99,9 +118,23 @@ class LitPerceptionModel(L.LightningModule):
                               z_mean=self.z_mean.cpu(), size_mean=self.size_mean.cpu())
         return [circle_nms(d) for d in dets]
 
+    def load_pretrained(self, state_dict: Dict[str, torch.Tensor]):
+        """
+        Load weights for fine-tuning. A LiDAR-only checkpoint can initialize a camera-fusion model: its BEV backbone
+        moves from the LiDAR encoder to the shared post-fusion backbone; the camera branch and fuser keep their init
+        (the fuser's zero-initialized last conv makes the model start out equal to the LiDAR-only one).
+        """
+        if self.use_camera:
+            old, new = "scene_encoder.encoders.lidar.backbone.", "scene_encoder.backbone."
+            state_dict = {(new + k[len(old):] if k.startswith(old) else k): v for k, v in state_dict.items()}
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            raise RuntimeError(f"Unexpected keys in checkpoint: {unexpected[:5]}")
+        return missing
+
     def _shared_step(self, batch: Dict[str, Any]):
-        bev = self.forward(batch)["bev"]
-        hm_logits, reg_pred = self.head(bev)
+        outs = self.forward(batch)
+        hm_logits, reg_pred = self.head(outs["bev"])
         hm_tgt, reg_tgt, reg_mask = build_targets(
             batch["gt_boxes"],
             batch["gt_labels"],
@@ -113,11 +146,17 @@ class LitPerceptionModel(L.LightningModule):
         hm_loss = sigmoid_focal_loss(hm_logits, hm_tgt)
         reg_loss = masked_l1(reg_pred, reg_tgt, reg_mask)
         loss = self.hm_weight * hm_loss + self.reg_weight * reg_loss
-        return loss, hm_loss, reg_loss, reg_mask, hm_logits, reg_pred
+        depth_loss = None
+        if self.use_camera:
+            depth_loss = self.scene_encoder.encoders["camera"].depth_loss(outs["cam_depth_logits"], batch["cam_depth"])
+            loss = loss + self.depth_weight * depth_loss
+        return loss, hm_loss, reg_loss, reg_mask, hm_logits, reg_pred, depth_loss
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
-        loss, hm_loss, reg_loss, reg_mask, _, _ = self._shared_step(batch)
+        loss, hm_loss, reg_loss, reg_mask, _, _, depth_loss = self._shared_step(batch)
         B = len(batch["lidar_points"])
+        if depth_loss is not None:
+            self.log("train/depth_loss", depth_loss, prog_bar=False, batch_size=B, on_step=True)
         self.log("train/loss", loss, prog_bar=True, batch_size=B, on_step=True)
         self.log("train/hm_loss", hm_loss, prog_bar=False, batch_size=B, on_step=True)
         self.log("train/reg_loss", reg_loss, prog_bar=False, batch_size=B, on_step=True)
@@ -125,9 +164,11 @@ class LitPerceptionModel(L.LightningModule):
         return loss
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int):
-        loss, hm_loss, reg_loss, reg_mask, hm_logits, reg_pred = self._shared_step(batch)
+        loss, hm_loss, reg_loss, reg_mask, hm_logits, reg_pred, depth_loss = self._shared_step(batch)
 
         B = len(batch["lidar_points"])
+        if depth_loss is not None:
+            self.log("val/depth_loss", depth_loss, prog_bar=False, batch_size=B)
         self.log("val/loss", loss, prog_bar=True, batch_size=B)
         self.log("val/hm_loss", hm_loss, prog_bar=False, batch_size=B)
         self.log("val/reg_loss", reg_loss, prog_bar=False, batch_size=B)
@@ -159,10 +200,18 @@ class LitPerceptionModel(L.LightningModule):
         self.val_ap.reset()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        # fine-tuning a fusion model from LiDAR weights: new modules (camera branch, fuser) train at lr,
+        # everything else at lr * pretrained_lr_scale so the pretrained LiDAR path isn't knocked out of its optimum
+        new_prefixes = ("scene_encoder.encoders.camera.", "scene_encoder.fusion.")
+        new = [p for n, p in self.named_parameters() if n.startswith(new_prefixes)]
+        old = [p for n, p in self.named_parameters() if not n.startswith(new_prefixes)]
+        groups = [{"params": old, "lr": self.lr * self.pretrained_lr_scale}]
+        if new:
+            groups.append({"params": new, "lr": self.lr})
+        optimizer = torch.optim.AdamW(groups, lr=self.lr, weight_decay=self.weight_decay)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=self.lr,
+            max_lr=[g["lr"] for g in groups],
             total_steps=int(self.trainer.estimated_stepping_batches),
             pct_start=self.pct_start,
             div_factor=10.0,

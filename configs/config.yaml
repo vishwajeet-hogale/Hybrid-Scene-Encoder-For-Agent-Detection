@@ -3,6 +3,7 @@ defaults:
   - datamodule: nuscenes
 
 seed: 42
+use_camera: false         # LiDAR-camera fusion (BEVFusion-style); run cache_camera_features.py first
 init_ckpt: null           # path to a .ckpt to fine-tune from (weights only; fresh optimizer and LR schedule)
 
 model:
@@ -21,6 +22,9 @@ model:
   weight_decay: 1e-2
   hm_weight: 1.0
   reg_weight: 0.25
+  use_camera: ${use_camera}
+  depth_weight: 0.5        # LiDAR-supervised depth loss of the camera branch
+  pretrained_lr_scale: 1.0 # LR multiplier for non-camera parameters (e.g. 0.1 when fine-tuning fusion from LiDAR weights)
 
 trainer:
   _target_: lightning.pytorch.Trainer

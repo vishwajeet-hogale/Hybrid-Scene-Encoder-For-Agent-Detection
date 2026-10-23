@@ -10,6 +10,8 @@ from nuscenes.utils.data_classes import LidarPointCloud, Box
 from nuscenes.utils.geometry_utils import transform_matrix
 from pyquaternion import Quaternion
 
+from src.data.camera import CAMERAS, CameraFeatureStore, build_camera_inputs
+
 
 
 # --- category -> class id (edit as you like) ---
@@ -72,10 +74,13 @@ def augment_scene(points: torch.Tensor, boxes: torch.Tensor,
       - left/right flip (y -> -y, yaw -> -yaw); no front/back flip since the BEV grid is not symmetric in x
       - rotation about the ego z axis by U(-max_rot, max_rot)
       - uniform scaling by U(scale_range)
+    Also returns the 4x4 matrix A of the same transform (p_aug = A @ p), used to move camera geometry consistently.
     """
     points, boxes = points.clone(), boxes.clone()
+    F = np.eye(4, dtype=np.float32)
 
     if torch.rand(1).item() < flip_prob:
+        F[1, 1] = -1.0
         points[:, 1] = -points[:, 1]
         boxes[:, 1] = -boxes[:, 1]
         boxes[:, 6] = -boxes[:, 6]
@@ -86,18 +91,21 @@ def augment_scene(points: torch.Tensor, boxes: torch.Tensor,
     points[:, :2] = points[:, :2] @ R.T
     boxes[:, :2] = boxes[:, :2] @ R.T
     boxes[:, 6] = boxes[:, 6] + theta
+    Rz = np.eye(4, dtype=np.float32)
+    Rz[:2, :2] = [[c, -s], [s, c]]
 
     scale = scale_range[0] + torch.rand(1).item() * (scale_range[1] - scale_range[0])
     points[:, :3] *= scale
     boxes[:, :6] *= scale
+    S = np.diag([scale, scale, scale, 1.0]).astype(np.float32)
 
     boxes[:, 6] = torch.atan2(torch.sin(boxes[:, 6]), torch.cos(boxes[:, 6]))  # wrap yaw to (-pi, pi]
-    return points, boxes
+    return points, boxes, torch.from_numpy(S @ Rz @ F)
 
 
 class NuScenesDataset(Dataset):
     def __init__(self, nusc: NuScenes, sample_tokens: List[str], split: str, bev_cfg: Dict[str, Any], map_cfg: Dict[str, Any],
-                 augment: bool = False):
+                 augment: bool = False, camera_store: Optional[CameraFeatureStore] = None):
         super().__init__()
         self.nusc = nusc
         self.sample_tokens = sample_tokens
@@ -105,6 +113,7 @@ class NuScenesDataset(Dataset):
         self.bev_cfg = bev_cfg
         self.map_cfg = map_cfg
         self.augment = augment
+        self.camera_store = camera_store  # set -> also return camera inputs for LiDAR-camera fusion
 
     def __len__(self) -> int:
         return len(self.sample_tokens)
@@ -156,15 +165,23 @@ class NuScenesDataset(Dataset):
             gt_boxes = torch.tensor(gt_boxes_list, dtype=torch.float32)
             gt_labels = torch.tensor(gt_labels_list, dtype=torch.int64)
 
+        cam = None
+        if self.camera_store is not None:
+            # built from the unaugmented points: depth is a camera-frame quantity; only cam2ego gets the augmentation
+            cam = build_camera_inputs(self.nusc, sd_token, [sample["data"][c] for c in CAMERAS],
+                                      points.numpy(), self.camera_store)
+
         if self.augment:
-            points, gt_boxes = augment_scene(points, gt_boxes)
+            points, gt_boxes, A = augment_scene(points, gt_boxes)
+            if cam is not None:
+                cam["cam2ego"] = A @ cam["cam2ego"]
 
         # placeholders (we’ll fill later)
         bev = torch.zeros(8, 200, 200, dtype=torch.float32)
         map_polylines = torch.zeros(self.map_cfg["max_polylines"], self.map_cfg["points_per_polyline"], 2, dtype=torch.float32)
         map_mask = torch.zeros(self.map_cfg["max_polylines"], dtype=torch.bool)
 
-        return {
+        out = {
             "sample_token": sample_token,
             "scene_token": sample["scene_token"],
             "lidar_points": points,     # [Ni,4]
@@ -174,3 +191,6 @@ class NuScenesDataset(Dataset):
             "map_polylines": map_polylines,
             "map_mask": map_mask,
         }
+        if cam is not None:
+            out.update(cam)  # cam_feats [6,384,18,32], cam2ego [6,4,4], cam_K [6,3,3], cam_depth [6,18,32]
+        return out
