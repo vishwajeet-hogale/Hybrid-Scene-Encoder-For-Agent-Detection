@@ -23,7 +23,7 @@ from nuscenes.utils.splits import create_splits_scenes
 from pyquaternion import Quaternion
 
 from src.data.camera import CAMERAS, CameraFeatureStore, build_camera_inputs
-from src.data.nuscenes_dataset import load_lidar_points_ego
+from src.data.nuscenes_dataset import load_lidar_points_ego, map_nuscenes_category_to_label, transform_box_global_to_ego
 from src.models.lit_perception_model import LitPerceptionModel
 
 
@@ -141,7 +141,7 @@ class BEVRenderer:
         self._draw_ego(img)
         return img
 
-    def render(self, points: np.ndarray, boxes: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    def render(self, points: np.ndarray, boxes: np.ndarray, labels: np.ndarray, gt_boxes: np.ndarray = None) -> np.ndarray:
         img = self._base(points, (80, 90, 115), (205, 228, 245))
 
         # predicted boxes: translucent fill + outline + heading tick
@@ -160,6 +160,13 @@ class BEVRenderer:
             front = corners[:2].mean(0)
             cv2.line(img, tuple(np.round(center * 16).astype(int)), tuple(np.round(front * 16).astype(int)),
                      color, 2, cv2.LINE_AA, shift=4)
+        # ground truth: thin white outlines with a heading tick (drawn on top so predictions can be compared)
+        for box in (gt_boxes if gt_boxes is not None else []):
+            corners = self.to_px(box_corners_3d(box)[:4, :2])
+            poly = np.round(corners * 16).astype(np.int32)
+            cv2.polylines(img, [poly], True, (245, 245, 250), 1, cv2.LINE_AA, shift=4)
+            c, f = corners.mean(0), corners[:2].mean(0)
+            cv2.line(img, tuple(np.round(c * 16).astype(int)), tuple(np.round(f * 16).astype(int)), (245, 245, 250), 1, cv2.LINE_AA, shift=4)
         self._draw_ego(img)
         return img
 
@@ -191,8 +198,20 @@ def draw_boxes_on_camera(img: np.ndarray, boxes: np.ndarray, labels: np.ndarray,
     return img
 
 
+def gt_boxes_ego(nusc: NuScenes, lidar_sd: Dict) -> np.ndarray:
+    """Ground-truth boxes of the detected classes at this sweep's timestamp (devkit-interpolated between keyframes), ego frame."""
+    ep = nusc.get("ego_pose", lidar_sd["ego_pose_token"])
+    out = []
+    for box in nusc.get_boxes(lidar_sd["token"]):
+        if map_nuscenes_category_to_label(box.name) is None:
+            continue
+        b = transform_box_global_to_ego(box, ep)
+        out.append([*b.center, *b.wlh, b.orientation.yaw_pitch_roll[0]])
+    return np.array(out, dtype=np.float32).reshape(-1, 7)
+
+
 def compose_frame(bev: np.ndarray, heat: np.ndarray, cam: np.ndarray, labels: np.ndarray,
-                  scene_name: str, t_sec: float, split_tag: str, title: str) -> np.ndarray:
+                  scene_name: str, t_sec: float, split_tag: str, title: str, show_gt: bool = False) -> np.ndarray:
     """Layout: title bar, camera across the top, BEV boxes | heatmap side by side below."""
     W, gap, top = cam.shape[1], 12, 70
     side = (W - gap) // 2
@@ -213,7 +232,7 @@ def compose_frame(bev: np.ndarray, heat: np.ndarray, cam: np.ndarray, labels: np
 
     # labels on the panels
     d.text((16, top + 12), "CAM_FRONT  ·  predicted 3D boxes projected", font=f_small, fill=(245, 245, 248))
-    d.text((16, y_bev + 12), "LiDAR bird's-eye view  ·  predicted boxes (ego frame)", font=f_small, fill=(200, 205, 215))
+    d.text((16, y_bev + 12), "LiDAR bird's-eye view  ·  predicted boxes (ego frame)" + ("  ·  white = ground truth" if show_gt else ""), font=f_small, fill=(200, 205, 215))
     d.text((side + gap + 16, y_bev + 12), "CenterHead heatmap  ·  sigmoid score > 0.05 (√ scaled), strongest class",
            font=f_small, fill=(200, 205, 215))
 
@@ -240,6 +259,7 @@ def main():
                     help="score threshold, one value or one per class (vehicle,pedestrian,cyclist)")
     ap.add_argument("--max_frames", type=int, default=0)
     ap.add_argument("--camera_cache", default="cache/dinov2_vits14", help="cached DINOv2 features (camera-fusion models)")
+    ap.add_argument("--gt", action="store_true", help="also draw ground-truth boxes (white) in the BEV panel")
     ap.add_argument("--gif_width", type=int, default=720)
     ap.add_argument("--gif_seconds", type=float, default=8.0, help="GIF length (the MP4 always has the full scene)")
     ap.add_argument("--crf", type=int, default=26, help="H.264 quality for the MP4 (lower = bigger/better)")
@@ -299,9 +319,10 @@ def main():
         K = np.array(nusc.get("calibrated_sensor", cam_sd["calibrated_sensor_token"])["camera_intrinsic"])
         cam_img = draw_boxes_on_camera(cam_img, boxes, labels, ego_lidar_to_camera(nusc, lidar_sd, cam_sd), K)
 
-        bev_img = bev_renderer.render(points.numpy(), boxes, labels)
+        gt = gt_boxes_ego(nusc, lidar_sd) if args.gt else None
+        bev_img = bev_renderer.render(points.numpy(), boxes, labels, gt)
         heat_img = bev_renderer.render_heatmap(hm, points.numpy(), boxes)
-        frame = compose_frame(bev_img, heat_img, cam_img, labels, args.scene, (lidar_sd["timestamp"] - t0) / 1e6, split_tag, title)
+        frame = compose_frame(bev_img, heat_img, cam_img, labels, args.scene, (lidar_sd["timestamp"] - t0) / 1e6, split_tag, title, args.gt)
         cv2.imwrite(os.path.join(frames_dir, f"{i:04d}.png"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         print(f"\rframe {i + 1}/{len(lidar_tokens)}  ({len(boxes)} boxes)", end="", flush=True)
     print()

@@ -104,12 +104,17 @@ def build_targets(
     prior: BoxPrior,
     min_overlap: float = 0.1,
     min_radius: int = 2,
+    neighbor_weight: float = 0.0,
 ):
     """
     Returns:
       heatmap: [B, C, H, W]
       reg_tgt: [B, 8, H, W]  (dx, dy, z - z_mean, log(w/w_mean), log(l/l_mean), log(h/h_mean), sin yaw, cos yaw)
-      reg_mask: [B, 1, H, W] (1 at positive centers)
+      reg_mask: [B, 1, H, W] (1 at positive centers; neighbor_weight at the 8 surrounding cells if > 0)
+
+    neighbor_weight > 0 also supervises the regression at the 3x3 cells around each center (dx, dy relative to
+    that cell), so a peak that lands one cell off still reads trained box parameters. A center cell always wins
+    over a neighbor cell; between two objects' neighbors, the closer center wins.
     """
     B = len(gt_boxes_list)
     H, W = grid.H, grid.W
@@ -119,6 +124,7 @@ def build_targets(
     reg_tgt = torch.zeros((B, 8, H, W), dtype=torch.float32, device=device)
     reg_mask = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
     z_mean, size_mean = prior.tensors(device)
+    owner_dist = torch.full((B, H, W), float("inf"))  # distance (cells) to the center that owns a neighbor cell
 
     for b in range(B):
         boxes = gt_boxes_list[b]
@@ -150,18 +156,27 @@ def build_targets(
             radius = max(min_radius, int(radius))
             heatmap[b, cls] = draw_gaussian(heatmap[b, cls], (ix, iy), radius)
 
-            # regression targets at center cell
-            reg_tgt[b, :, iy, ix] = torch.tensor([
-                fx - ix,
-                fy - iy,
+            # regression targets at the center cell (and optionally its 8 neighbors)
+            box_tgt = [
                 z - float(z_mean[cls]),
                 math.log(max(w, 1e-2) / float(size_mean[cls, 0])),
                 math.log(max(l, 1e-2) / float(size_mean[cls, 1])),
                 math.log(max(h, 1e-2) / float(size_mean[cls, 2])),
                 math.sin(yaw),
                 math.cos(yaw),
-            ], device=device)
-
-            reg_mask[b, 0, iy, ix] = 1.0
+            ]
+            offsets = [(0, 0)] if neighbor_weight <= 0 else [(dx, dy) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
+            for dx, dy in offsets:
+                cx, cy = ix + dx, iy + dy
+                if cx < 0 or cx >= W or cy < 0 or cy >= H:
+                    continue
+                weight = 1.0 if (dx, dy) == (0, 0) else neighbor_weight
+                dist = math.hypot(fx - (cx + 0.5), fy - (cy + 0.5))
+                current = float(reg_mask[b, 0, cy, cx])
+                if weight < current or (weight == current and dist >= float(owner_dist[b, cy, cx])):
+                    continue
+                reg_tgt[b, :, cy, cx] = torch.tensor([fx - cx, fy - cy] + box_tgt, device=device)
+                reg_mask[b, 0, cy, cx] = weight
+                owner_dist[b, cy, cx] = dist
 
     return heatmap, reg_tgt, reg_mask

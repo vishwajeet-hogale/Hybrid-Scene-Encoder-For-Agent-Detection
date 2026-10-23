@@ -42,6 +42,7 @@ LiDAR points ──► group into 0.5 m vertical columns ("pillars") ──► t
 9. Compare v1 vs v2.
 10. Find out what the improved model still gets wrong (overfitting, heading, false positives).
 11. Add the cameras: LiDAR-camera fusion (BEVFusion-style).
+12. Try to fix heading (orientation), and find out why it doesn't generalize.
 
 ---
 
@@ -506,6 +507,49 @@ LiDAR point's exact pixel.
 .venv/bin/python cache_camera_features.py                      # once: DINOv2 features for all keyframe images
 .venv/bin/python train.py use_camera=true init_ckpt=<lidar best.ckpt> model.lr=1e-3 model.pretrained_lr_scale=0.1
 ```
+
+---
+
+### Step 12 — Heading: what was tried, and why it doesn't generalize
+
+**Short version:** three changes aimed at heading did nothing on unseen scenes. A diagnostic showed why: the
+model predicts heading well on the scenes it trained on (median error under 10°) but not on new ones — it
+memorizes headings instead of reading them from the point shape. That's a data problem, not a bug or a model-size
+problem.
+
+**Deep dive**
+
+*What was tried* (all available as options in `configs/config.yaml`, off by default):
+
+- `reg_neighbor_weight: 0.5` — supervise the box regression at the 3×3 cells around each center (9× more heading
+  supervision; a peak one cell off still reads trained values). Neighbor dx/dy are relative to each cell, so every
+  supervised cell decodes to the exact box (checked: max error 2e-7).
+- `yaw_weight: 2.0` — double weight for the sin/cos channels in the L1 loss.
+- `heading_weight: 0.5` — a direct heading loss `1 − cos(Δyaw)` on the normalized (sin, cos) prediction:
+  0 = correct, 1 = 90° off, 2 = 180° off.
+- A new validation metric, `val/yaw_err_<class>`: mean heading error of matched detections (a simple version of
+  nuScenes' AOE), logged every epoch.
+
+*Result* — fine-tuning the fusion model with and without these changes (24 epochs each):
+
+| | Vehicle heading error (val) | mAP |
+|---|---|---|
+| Starting fusion model | 78° | 0.204 |
+| With heading changes | 76–83° over training | ~0.19–0.20 |
+| Control (no changes) | 75–82° over training | ~0.19–0.21 |
+
+*Diagnosis* — same model, same metric, training vs held-out scenes, against trivial baselines:
+
+| Matched cars | Model (mean / median) | "always 0°" | "closer of 0°/180°" |
+|---|---|---|---|
+| Training scenes | **26° / 9.8°** | 99° | 42° |
+| Val scenes | **76° / 64°** | 88° | 42° |
+
+So targets, augmentation and decoding are correct (the model learns heading where it has data), and capacity is
+not the issue (more channels would only make memorizing easier). On unseen scenes the model is worse than the
+trivial "along or against the road" guess. Fixes that address generalization: more data, multi-sweep input
+(denser points show the car's shape), and full 360° rotation augmentation (today ±22.5°), so headings can't be
+memorized per location.
 
 ---
 

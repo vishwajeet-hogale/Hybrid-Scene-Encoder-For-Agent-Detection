@@ -1,10 +1,16 @@
-# Hybrid Scene Encoder for Autonomous Driving
+# 4DoF 3D Object Detection
+
+*Hybrid scene encoder for autonomous driving: LiDAR + camera fusion on nuScenes.*
 
 ![Demo: predicted 3D boxes on a held-out nuScenes scene](docs/media/demo_scene-0103.gif)
 
 *LiDAR + camera fusion on held-out nuScenes scene-0103. Top: front camera with the predicted 3D boxes projected
 into it. Bottom left: LiDAR bird's-eye view with boxes. Bottom right: the CenterHead heatmap (where the model
 "sees" object centers).*
+
+## Architecture
+
+![Architecture: LiDAR pillars and camera Lift-Splat branches fused in a shared bird's-eye-view grid, followed by a multi-scale backbone and a CenterPoint-style head](docs/media/architecture.svg)
 
 ## Current results (nuScenes-mini)
 

@@ -20,11 +20,25 @@ def sigmoid_focal_loss(pred_logits: torch.Tensor, target: torch.Tensor, alpha=2.
     return (pos_loss.sum() + neg_loss.sum()) / num_pos
 
 
-def masked_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
+def masked_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, channel_weights: torch.Tensor = None):
     """
     pred/target: [B, D, H, W]
-    mask:        [B, 1, H, W]
+    mask:        [B, 1, H, W] (per-cell weights)
+    channel_weights: optional [D] multiplier per regression channel (e.g. a higher weight for sin/cos yaw)
     """
     diff = (pred - target).abs() * mask
+    if channel_weights is not None:
+        diff = diff * channel_weights.view(1, -1, 1, 1)
     denom = mask.sum().clamp(min=1.0)
     return diff.sum() / denom
+
+
+def heading_loss(pred_sincos: torch.Tensor, target_sincos: torch.Tensor, mask: torch.Tensor):
+    """
+    Direct heading error: 1 - cos(predicted yaw - target yaw), only the angle counts (the predicted (sin, cos)
+    vector is normalized). 0 = correct, 1 = 90 deg off, 2 = 180 deg off.
+    pred_sincos/target_sincos: [B, 2, H, W] (sin, cos); mask: [B, 1, H, W] (per-cell weights)
+    """
+    norm = pred_sincos.norm(dim=1, keepdim=True).clamp(min=1e-6)
+    cos_diff = (pred_sincos * target_sincos).sum(dim=1, keepdim=True) / norm
+    return ((1.0 - cos_diff) * mask).sum() / mask.sum().clamp(min=1.0)

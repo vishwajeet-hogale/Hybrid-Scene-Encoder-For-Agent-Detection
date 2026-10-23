@@ -11,7 +11,7 @@ from src.models.fusion import ConvFuser
 from src.models.lidar.pillars import PillarConfig
 from src.models.heads.center_head import CenterHead
 from src.models.heads.targets import BoxPrior, GridSpec, build_targets
-from src.models.heads.losses import sigmoid_focal_loss, masked_l1
+from src.models.heads.losses import heading_loss, masked_l1, sigmoid_focal_loss
 from src.eval.center_ap import CenterDistanceAP
 from src.vis.decode import circle_nms, decode_centers
 from src.vis.bev_plot import visualize_sample_bev
@@ -37,6 +37,9 @@ class LitPerceptionModel(L.LightningModule):
         use_camera: bool = False,
         depth_weight: float = 0.5,
         pretrained_lr_scale: float = 1.0,
+        reg_neighbor_weight: float = 0.0,
+        yaw_weight: float = 1.0,
+        heading_weight: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -93,6 +96,9 @@ class LitPerceptionModel(L.LightningModule):
         self.weight_decay = weight_decay
         self.pct_start = pct_start
         self.pretrained_lr_scale = pretrained_lr_scale
+        self.reg_neighbor_weight = reg_neighbor_weight   # >0: also supervise the regression at the 3x3 cells around centers
+        self.reg_channel_weights = [1.0] * 6 + [yaw_weight] * 2  # dx, dy, z, log w/l/h, sin/cos yaw
+        self.heading_weight = heading_weight                    # weight of the direct 1 - cos(yaw error) loss
 
     def transfer_batch_to_device(self, batch: Dict[str, Any], device: torch.device, dataloader_idx: int):
         # lidar_points / gt_boxes / gt_labels stay on CPU: pillarization, target building and AP matching are
@@ -141,20 +147,26 @@ class LitPerceptionModel(L.LightningModule):
             grid=self.grid,
             num_classes=self.num_classes,
             prior=self.prior,
+            neighbor_weight=self.reg_neighbor_weight,
         )
         hm_tgt, reg_tgt, reg_mask = hm_tgt.to(self.device), reg_tgt.to(self.device), reg_mask.to(self.device)
         hm_loss = sigmoid_focal_loss(hm_logits, hm_tgt)
-        reg_loss = masked_l1(reg_pred, reg_tgt, reg_mask)
+        reg_loss = masked_l1(reg_pred, reg_tgt, reg_mask,
+                             channel_weights=torch.tensor(self.reg_channel_weights, device=self.device))
         loss = self.hm_weight * hm_loss + self.reg_weight * reg_loss
+        head_loss = heading_loss(reg_pred[:, 6:8], reg_tgt[:, 6:8], reg_mask)
+        if self.heading_weight > 0:
+            loss = loss + self.heading_weight * head_loss
         depth_loss = None
         if self.use_camera:
             depth_loss = self.scene_encoder.encoders["camera"].depth_loss(outs["cam_depth_logits"], batch["cam_depth"])
             loss = loss + self.depth_weight * depth_loss
-        return loss, hm_loss, reg_loss, reg_mask, hm_logits, reg_pred, depth_loss
+        return loss, hm_loss, reg_loss, reg_mask, hm_logits, reg_pred, depth_loss, head_loss
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
-        loss, hm_loss, reg_loss, reg_mask, _, _, depth_loss = self._shared_step(batch)
+        loss, hm_loss, reg_loss, reg_mask, _, _, depth_loss, head_loss = self._shared_step(batch)
         B = len(batch["lidar_points"])
+        self.log("train/heading_loss", head_loss, prog_bar=False, batch_size=B, on_step=True)
         if depth_loss is not None:
             self.log("train/depth_loss", depth_loss, prog_bar=False, batch_size=B, on_step=True)
         self.log("train/loss", loss, prog_bar=True, batch_size=B, on_step=True)
@@ -164,9 +176,10 @@ class LitPerceptionModel(L.LightningModule):
         return loss
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int):
-        loss, hm_loss, reg_loss, reg_mask, hm_logits, reg_pred, depth_loss = self._shared_step(batch)
+        loss, hm_loss, reg_loss, reg_mask, hm_logits, reg_pred, depth_loss, head_loss = self._shared_step(batch)
 
         B = len(batch["lidar_points"])
+        self.log("val/heading_loss", head_loss, prog_bar=False, batch_size=B)
         if depth_loss is not None:
             self.log("val/depth_loss", depth_loss, prog_bar=False, batch_size=B)
         self.log("val/loss", loss, prog_bar=True, batch_size=B)
@@ -197,6 +210,7 @@ class LitPerceptionModel(L.LightningModule):
             self.log("val/mAP", ap["mAP"], prog_bar=True)
             for name in CLASS_NAMES:
                 self.log(f"val/AP_{name}", ap[name])
+                self.log(f"val/yaw_err_{name}", ap[f"yaw_err_{name}"])
         self.val_ap.reset()
 
     def configure_optimizers(self):

@@ -25,6 +25,10 @@ model:
   use_camera: ${use_camera}
   depth_weight: 0.5        # LiDAR-supervised depth loss of the camera branch
   pretrained_lr_scale: 1.0 # LR multiplier for non-camera parameters (e.g. 0.1 when fine-tuning fusion from LiDAR weights)
+  # heading options (tried; no gain on mini_val, see walkthrough Step 12): 0.5 / 2.0 / 0.5 to enable
+  reg_neighbor_weight: 0.0 # also supervise box regression at the 3x3 cells around each center (0 = center only)
+  yaw_weight: 1.0          # loss weight of the sin/cos yaw channels relative to the other regression channels
+  heading_weight: 0.0      # direct heading loss, 1 - cos(yaw error), at the supervised cells
 
 trainer:
   _target_: lightning.pytorch.Trainer
