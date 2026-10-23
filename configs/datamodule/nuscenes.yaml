@@ -1,17 +1,18 @@
 _target_: src.data.nuscenes_datamodule.NuScenesDataModule
 
 data_root: nuscenes-mini
-version: v1.0-mini         # change to v1.0-trainval later
-train_split: train
-val_split: val
-test_split: test
+version: v1.0-mini         # change to v1.0-trainval later (and splits to train/val)
+train_split: mini_train
+val_split: mini_val
+test_split: mini_val     # mini has no test split; use "test" with v1.0-test
 
 batch_size: 8
 num_workers: 4
 pin_memory: false
-persistent_workers: false
+persistent_workers: true     # avoid re-spawning workers (and re-pickling NuScenes) every epoch
 shuffle: true
 drop_last: true
+augment: true              # flip / rotate / scale on the train split only
 
 
 # future knobs (we’ll use later)

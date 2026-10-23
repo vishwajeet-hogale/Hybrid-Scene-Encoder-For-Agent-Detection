@@ -39,10 +39,15 @@ def decode_centers(
     grid: GridSpec,
     K: int = 100,
     score_thresh: float = 0.3,
+    nms_kernel: int = 3,
+    z_mean: torch.Tensor = None,
+    size_mean: torch.Tensor = None,
 ):
     """
     hm_logits: [B,C,H,W] (logits)
     reg:       [B,8,H,W]
+    nms_kernel: keep only local maxima in a kernel x kernel window (CenterNet-style NMS); 1 disables it
+    z_mean [C], size_mean [C,3]: per-class priors the z / log-size targets were normalized with (see BoxPrior)
     returns list (len B) of dict with:
       boxes:  [M,7] (x,y,z,w,l,h,yaw) in ego meters
       scores: [M]
@@ -50,6 +55,9 @@ def decode_centers(
     """
     B, C, H, W = hm_logits.shape
     hm = torch.sigmoid(hm_logits)
+    if nms_kernel > 1:
+        hmax = torch.nn.functional.max_pool2d(hm, nms_kernel, stride=1, padding=nms_kernel // 2)
+        hm = hm * (hmax == hm).float()
 
     scores, labels, ys, xs = topk_heatmap(hm, K=K)  # [B,K] each
     out = []
@@ -76,6 +84,10 @@ def decode_centers(
         w = torch.exp(r[3]).clamp(min=0.1)
         l = torch.exp(r[4]).clamp(min=0.1)
         h = torch.exp(r[5]).clamp(min=0.1)
+        if z_mean is not None:
+            z = z + z_mean[lab]
+        if size_mean is not None:
+            w, l, h = w * size_mean[lab, 0], l * size_mean[lab, 1], h * size_mean[lab, 2]
         sin_yaw, cos_yaw = r[6], r[7]
         yaw = torch.atan2(sin_yaw, cos_yaw)
 
@@ -89,3 +101,27 @@ def decode_centers(
         out.append({"boxes": boxes, "scores": s, "labels": lab})
 
     return out
+
+
+def circle_nms(det: dict, radius_per_class=(2.0, 0.5, 1.0)) -> dict:
+    """
+    CenterPoint-style circle NMS on one decoded sample: greedily keep the highest-scoring center and drop
+    same-class centers within that class's radius (meters, BEV). det: {"boxes": [M,7], "scores": [M], "labels": [M]}
+    """
+    boxes, scores, labels = det["boxes"], det["scores"], det["labels"]
+    if boxes.shape[0] == 0:
+        return det
+    order = torch.argsort(scores, descending=True)
+    boxes, scores, labels = boxes[order], scores[order], labels[order]
+
+    radius = torch.tensor(radius_per_class, device=boxes.device)[labels]  # [M]
+    dist = torch.cdist(boxes[:, :2], boxes[:, :2])                         # [M,M]
+    suppress = (dist < radius[:, None]) & (labels[:, None] == labels[None, :])
+
+    keep = torch.ones(boxes.shape[0], dtype=torch.bool, device=boxes.device)
+    for i in range(boxes.shape[0]):
+        if keep[i]:
+            s = suppress[i].clone()
+            s[: i + 1] = False
+            keep &= ~s
+    return {"boxes": boxes[keep], "scores": scores[keep], "labels": labels[keep]}

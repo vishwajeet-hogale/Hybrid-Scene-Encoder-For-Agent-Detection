@@ -76,18 +76,43 @@ def pillarize(points_ego: torch.Tensor, cfg: PillarConfig, H: int, W: int):
     pillar_points = torch.zeros((P, T, 4), device=device, dtype=torch.float32)
     mask = torch.zeros((P, T), device=device, dtype=torch.bool)
 
-    # 5) Fill each pillar up to T points
-    # Simple (correct) implementation: loop over pillars
-    for p in range(P):
-        idxs = torch.nonzero(inv == p, as_tuple=False).squeeze(1)
-        if idxs.numel() == 0:
-            continue
-        idxs = idxs[:T]
-        pillar_points[p, : idxs.numel(), :] = points[idxs]
-        mask[p, : idxs.numel()] = True
+    # 5) Fill each pillar up to T points (vectorized)
+    # sort points by pillar, then each point's slot = its rank within its pillar
+    order = torch.argsort(inv, stable=True)
+    inv_sorted = inv[order]
+    counts = torch.bincount(inv_sorted, minlength=P)
+    starts = torch.cumsum(counts, 0) - counts                                # [P] first index of each pillar
+    rank = torch.arange(inv_sorted.shape[0], device=device) - starts[inv_sorted]
+
+    keep_slot = rank < T
+    p_idx = inv_sorted[keep_slot]
+    t_idx = rank[keep_slot]
+    pillar_points[p_idx, t_idx] = points[order[keep_slot]]
+    mask[p_idx, t_idx] = True
 
     coords = uniq.long()  # [P,2] (iy, ix)
     return pillar_points, coords, mask
+
+
+def decorate_pillar_points(pillar_points: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor, cfg: PillarConfig):
+    """
+    PointPillars point decoration: [P,T,4] -> [P,T,9]
+      x, y, z, intensity,
+      x - x_mean, y - y_mean, z - z_mean   (offset from the pillar's point centroid)
+      x - x_center, y - y_center           (offset from the pillar's grid-cell center)
+    Padded points stay all-zero.
+    """
+    m = mask.unsqueeze(-1).to(pillar_points.dtype)                   # [P,T,1]
+    xyz = pillar_points[..., :3]
+    n = m.sum(dim=1, keepdim=True).clamp(min=1.0)                    # [P,1,1]
+    f_cluster = xyz - (xyz * m).sum(dim=1, keepdim=True) / n         # [P,T,3]
+
+    vx, vy = cfg.voxel_size
+    x_center = cfg.x_range[0] + (coords[:, 1].to(pillar_points.dtype) + 0.5) * vx   # coords = (iy, ix)
+    y_center = cfg.y_range[0] + (coords[:, 0].to(pillar_points.dtype) + 0.5) * vy
+    f_center = xyz[..., :2] - torch.stack([x_center, y_center], dim=-1).unsqueeze(1)  # [P,T,2]
+
+    return torch.cat([pillar_points, f_cluster, f_center], dim=-1) * m
 
 
 def scatter_to_bev(pillar_feats: torch.Tensor, coords: torch.Tensor, H: int, W: int):

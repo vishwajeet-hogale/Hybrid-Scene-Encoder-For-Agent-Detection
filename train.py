@@ -1,4 +1,5 @@
 import hydra
+import torch
 from omegaconf import DictConfig
 import lightning.pytorch as L
 
@@ -10,6 +11,12 @@ def main(cfg: DictConfig):
     dm = hydra.utils.instantiate(cfg.datamodule)
     model = hydra.utils.instantiate(cfg.model)
     trainer = hydra.utils.instantiate(cfg.trainer)
+
+    # fine-tuning: start from trained weights with a fresh optimizer / LR schedule (unlike ckpt_path resume)
+    if cfg.get("init_ckpt"):
+        state = torch.load(hydra.utils.to_absolute_path(cfg.init_ckpt), map_location="cpu", weights_only=False)
+        model.load_state_dict(state["state_dict"])
+        print(f"Initialized weights from {cfg.init_ckpt}")
 
     trainer.fit(model, datamodule=dm)
 

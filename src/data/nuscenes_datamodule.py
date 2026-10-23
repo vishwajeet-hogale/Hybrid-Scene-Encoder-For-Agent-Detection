@@ -47,6 +47,7 @@ class NuScenesDataModule(L.LightningDataModule):
         drop_last: bool,
         bev: Dict[str, Any],
         map: Dict[str, Any],
+        augment: bool = True,
     ):
         super().__init__()
         self.data_root = data_root
@@ -65,6 +66,7 @@ class NuScenesDataModule(L.LightningDataModule):
 
         self.bev_cfg = bev
         self.map_cfg = map
+        self.augment = augment
 
         self.nusc: Optional[NuScenes] = None
         self.ds_train: Optional[NuScenesDataset] = None
@@ -85,7 +87,8 @@ class NuScenesDataModule(L.LightningDataModule):
             train_tokens = build_samples_from_scenes(self.nusc, train_scenes)
             val_tokens = build_samples_from_scenes(self.nusc, val_scenes)
 
-            self.ds_train = NuScenesDataset(self.nusc, train_tokens, split="train", bev_cfg=self.bev_cfg, map_cfg=self.map_cfg)
+            self.ds_train = NuScenesDataset(self.nusc, train_tokens, split="train", bev_cfg=self.bev_cfg, map_cfg=self.map_cfg,
+                                           augment=self.augment)
             self.ds_val = NuScenesDataset(self.nusc, val_tokens, split="val", bev_cfg=self.bev_cfg, map_cfg=self.map_cfg)
 
         if stage in (None, "test"):
