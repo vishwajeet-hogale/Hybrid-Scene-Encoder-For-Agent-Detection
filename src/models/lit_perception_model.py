@@ -11,7 +11,7 @@ from src.models.fusion import ConvFuser
 from src.models.lidar.pillars import PillarConfig
 from src.models.heads.center_head import CenterHead
 from src.models.heads.targets import BoxPrior, GridSpec, build_targets
-from src.models.heads.losses import heading_loss, masked_l1, sigmoid_focal_loss
+from src.models.heads.losses import heading_loss, masked_l1, masked_mse, sigmoid_focal_loss
 from src.eval.center_ap import CenterDistanceAP
 from src.vis.decode import circle_nms, decode_centers
 from src.vis.bev_plot import visualize_sample_bev
@@ -40,6 +40,9 @@ class LitPerceptionModel(L.LightningModule):
         reg_neighbor_weight: float = 0.0,
         yaw_weight: float = 1.0,
         heading_weight: float = 0.0,
+        reg_loss: str = "l1",
+        loss_norm: bool = False,
+        loss_ema: float = 0.98,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -99,6 +102,12 @@ class LitPerceptionModel(L.LightningModule):
         self.reg_neighbor_weight = reg_neighbor_weight   # >0: also supervise the regression at the 3x3 cells around centers
         self.reg_channel_weights = [1.0] * 6 + [yaw_weight] * 2  # dx, dy, z, log w/l/h, sin/cos yaw
         self.heading_weight = heading_weight                    # weight of the direct 1 - cos(yaw error) loss
+        if reg_loss not in ("l1", "mse"):
+            raise ValueError(f"reg_loss must be 'l1' or 'mse', got {reg_loss!r}")
+        self.reg_loss_fn = masked_l1 if reg_loss == "l1" else masked_mse
+        self.loss_norm = loss_norm          # normalize each loss term by its running average; weights sum to 1
+        self.loss_ema = loss_ema
+        self._loss_ema: Dict[str, torch.Tensor] = {}
 
     def transfer_batch_to_device(self, batch: Dict[str, Any], device: torch.device, dataloader_idx: int):
         # lidar_points / gt_boxes / gt_labels stay on CPU: pillarization, target building and AP matching are
@@ -138,6 +147,25 @@ class LitPerceptionModel(L.LightningModule):
             raise RuntimeError(f"Unexpected keys in checkpoint: {unexpected[:5]}")
         return missing
 
+    def _combine_losses(self, terms: Dict[str, Any]) -> torch.Tensor:
+        """
+        Weighted sum of the loss terms. With loss_norm, every term is divided by a running average of its own value
+        (EMA, no gradient) and the weights are normalized to sum to 1, so each weight is that term's share of the
+        training signal regardless of the raw loss scales (focal ~2, MSE ~0.7, heading ~0.5, ...).
+        """
+        if not self.loss_norm:
+            return sum(w * l for l, w in terms.values())
+        total_w = sum(w for _, w in terms.values())
+        loss = 0.0
+        for name, (l, w) in terms.items():
+            value = l.detach()
+            if self.training:
+                prev = self._loss_ema.get(name)
+                self._loss_ema[name] = value if prev is None else self.loss_ema * prev + (1 - self.loss_ema) * value
+            scale = self._loss_ema.get(name, value).clamp(min=1e-6)
+            loss = loss + (w / total_w) * l / scale
+        return loss
+
     def _shared_step(self, batch: Dict[str, Any]):
         outs = self.forward(batch)
         hm_logits, reg_pred = self.head(outs["bev"])
@@ -151,16 +179,17 @@ class LitPerceptionModel(L.LightningModule):
         )
         hm_tgt, reg_tgt, reg_mask = hm_tgt.to(self.device), reg_tgt.to(self.device), reg_mask.to(self.device)
         hm_loss = sigmoid_focal_loss(hm_logits, hm_tgt)
-        reg_loss = masked_l1(reg_pred, reg_tgt, reg_mask,
-                             channel_weights=torch.tensor(self.reg_channel_weights, device=self.device))
-        loss = self.hm_weight * hm_loss + self.reg_weight * reg_loss
+        reg_loss = self.reg_loss_fn(reg_pred, reg_tgt, reg_mask,
+                                    channel_weights=torch.tensor(self.reg_channel_weights, device=self.device))
         head_loss = heading_loss(reg_pred[:, 6:8], reg_tgt[:, 6:8], reg_mask)
-        if self.heading_weight > 0:
-            loss = loss + self.heading_weight * head_loss
         depth_loss = None
+        terms = {"hm": (hm_loss, self.hm_weight), "reg": (reg_loss, self.reg_weight)}
+        if self.heading_weight > 0:
+            terms["heading"] = (head_loss, self.heading_weight)
         if self.use_camera:
             depth_loss = self.scene_encoder.encoders["camera"].depth_loss(outs["cam_depth_logits"], batch["cam_depth"])
-            loss = loss + self.depth_weight * depth_loss
+            terms["depth"] = (depth_loss, self.depth_weight)
+        loss = self._combine_losses(terms)
         return loss, hm_loss, reg_loss, reg_mask, hm_logits, reg_pred, depth_loss, head_loss
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):

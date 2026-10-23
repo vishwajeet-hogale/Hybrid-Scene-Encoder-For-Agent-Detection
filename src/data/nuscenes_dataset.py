@@ -105,7 +105,7 @@ def augment_scene(points: torch.Tensor, boxes: torch.Tensor,
 
 class NuScenesDataset(Dataset):
     def __init__(self, nusc: NuScenes, sample_tokens: List[str], split: str, bev_cfg: Dict[str, Any], map_cfg: Dict[str, Any],
-                 augment: bool = False, camera_store: Optional[CameraFeatureStore] = None):
+                 augment: bool = False, camera_store: Optional[CameraFeatureStore] = None, aug_max_rot_deg: float = 22.5):
         super().__init__()
         self.nusc = nusc
         self.sample_tokens = sample_tokens
@@ -113,6 +113,7 @@ class NuScenesDataset(Dataset):
         self.bev_cfg = bev_cfg
         self.map_cfg = map_cfg
         self.augment = augment
+        self.aug_max_rot = float(np.radians(aug_max_rot_deg))  # global rotation augmentation range (+/-)
         self.camera_store = camera_store  # set -> also return camera inputs for LiDAR-camera fusion
 
     def __len__(self) -> int:
@@ -172,7 +173,7 @@ class NuScenesDataset(Dataset):
                                       points.numpy(), self.camera_store)
 
         if self.augment:
-            points, gt_boxes, A = augment_scene(points, gt_boxes)
+            points, gt_boxes, A = augment_scene(points, gt_boxes, max_rot=self.aug_max_rot)
             if cam is not None:
                 cam["cam2ego"] = A @ cam["cam2ego"]
 

@@ -551,6 +551,15 @@ trivial "along or against the road" guess. Fixes that address generalization: mo
 (denser points show the car's shape), and full 360° rotation augmentation (today ±22.5°), so headings can't be
 memorized per location.
 
+*Loss reshaping didn't help either.* A further run switched the box regression to MSE (`model.reg_loss=mse`) and
+normalized every loss term by its running average with weights summing to 1 (`model.loss_norm=true`; heatmap 0.29,
+regression 0.43, heading 0.14, depth 0.14). On training scenes the regression and heading losses fell further
+(heading 0.54 → 0.24), but on val it tied with the control (mAP 0.191 vs 0.191, vehicle heading 82° vs 79°), and
+with the heatmap's smaller share vehicle scores dropped. Both options remain available; defaults stay L1 and fixed
+weights. A practical lesson from this run: DataLoader workers each started their own BLAS thread pool, which under
+memory pressure busy-waited inside a numpy matmul for half an hour — `train.py` now pins BLAS/OpenMP to one thread
+per process (and steps got faster, 2.2 s → 1.4 s).
+
 ---
 
 ## Part 3 — Reproducing everything

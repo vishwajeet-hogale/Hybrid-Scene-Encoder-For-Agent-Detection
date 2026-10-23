@@ -7,14 +7,15 @@ val_split: mini_val
 test_split: mini_val     # mini has no test split; use "test" with v1.0-test
 
 batch_size: 8
-num_workers: 4
+num_workers: 2               # data loading (~30 ms/sample) is far faster than a training step (~2 s)
 pin_memory: false
 persistent_workers: true     # avoid re-spawning workers (and re-pickling NuScenes) every epoch
 shuffle: true
 drop_last: true
 use_camera: ${use_camera}
 camera_cache: cache/dinov2_vits14
-augment: true              # flip / rotate / scale on the train split only
+augment: true
+aug_max_rot_deg: 22.5        # random rotation range (+/- degrees); 180 = full 360-degree rotation              # flip / rotate / scale on the train split only
 
 
 # future knobs (we’ll use later)

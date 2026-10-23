@@ -29,6 +29,8 @@ model:
   reg_neighbor_weight: 0.0 # also supervise box regression at the 3x3 cells around each center (0 = center only)
   yaw_weight: 1.0          # loss weight of the sin/cos yaw channels relative to the other regression channels
   heading_weight: 0.0      # direct heading loss, 1 - cos(yaw error), at the supervised cells
+  reg_loss: l1             # box regression loss: l1 or mse (mse squares errors: raise reg_weight to penalize more)
+  loss_norm: false         # divide each loss by its running average and normalize the weights to sum to 1
 
 trainer:
   _target_: lightning.pytorch.Trainer

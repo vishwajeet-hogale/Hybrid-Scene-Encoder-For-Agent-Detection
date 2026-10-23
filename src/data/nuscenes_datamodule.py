@@ -51,6 +51,7 @@ class NuScenesDataModule(L.LightningDataModule):
         augment: bool = True,
         use_camera: bool = False,
         camera_cache: str = "cache/dinov2_vits14",
+        aug_max_rot_deg: float = 22.5,
     ):
         super().__init__()
         self.data_root = data_root
@@ -70,6 +71,7 @@ class NuScenesDataModule(L.LightningDataModule):
         self.bev_cfg = bev
         self.map_cfg = map
         self.augment = augment
+        self.aug_max_rot_deg = aug_max_rot_deg
         # camera fusion: cached DINOv2 features (run cache_camera_features.py first)
         self.camera_store = CameraFeatureStore(camera_cache) if use_camera else None
 
@@ -93,7 +95,8 @@ class NuScenesDataModule(L.LightningDataModule):
             val_tokens = build_samples_from_scenes(self.nusc, val_scenes)
 
             self.ds_train = NuScenesDataset(self.nusc, train_tokens, split="train", bev_cfg=self.bev_cfg, map_cfg=self.map_cfg,
-                                           augment=self.augment, camera_store=self.camera_store)
+                                           augment=self.augment, camera_store=self.camera_store,
+                                           aug_max_rot_deg=self.aug_max_rot_deg)
             self.ds_val = NuScenesDataset(self.nusc, val_tokens, split="val", bev_cfg=self.bev_cfg, map_cfg=self.map_cfg,
                                          camera_store=self.camera_store)
 

@@ -42,3 +42,12 @@ def heading_loss(pred_sincos: torch.Tensor, target_sincos: torch.Tensor, mask: t
     norm = pred_sincos.norm(dim=1, keepdim=True).clamp(min=1e-6)
     cos_diff = (pred_sincos * target_sincos).sum(dim=1, keepdim=True) / norm
     return ((1.0 - cos_diff) * mask).sum() / mask.sum().clamp(min=1.0)
+
+
+def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, channel_weights: torch.Tensor = None):
+    """Like masked_l1 but squared error: large errors cost much more, errors below 1 cost less."""
+    diff = (pred - target).pow(2) * mask
+    if channel_weights is not None:
+        diff = diff * channel_weights.view(1, -1, 1, 1)
+    denom = mask.sum().clamp(min=1.0)
+    return diff.sum() / denom

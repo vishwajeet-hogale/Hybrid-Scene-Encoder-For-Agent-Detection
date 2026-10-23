@@ -1,3 +1,11 @@
+import os
+
+# One BLAS/OpenMP thread per process (set before numpy/torch load; DataLoader workers inherit it). Each worker
+# otherwise starts its own BLAS thread pool for small numpy matmuls; under memory pressure those pools can
+# busy-wait for minutes inside dgemm and stall training.
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import hydra
 import torch
 from omegaconf import DictConfig
